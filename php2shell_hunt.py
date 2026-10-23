@@ -1,19 +1,20 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-php2shell_hunt.py - hunt for PHP2Shell traces on ISPConfig servers.
+php2shell_hunt.py - hunt for PHP2Shell traces on ISPConfig, cPanel,
+DirectAdmin and single-site servers.
 
 PHP2Shell covers two PHP engine bugs fixed on 2026-10-21
 (8.2.35, 8.3.36, 8.4.27, 8.5.12; affected back to PHP 5.4):
 
-  CVE-2026-109618 "rawkey"     OOM while parsing $_POST, triggered by a huge
-                               field name (>1 MB, urlencoded or multipart).
-                               Error log signature:
-                               "Allowed memory size ... in Unknown on line 0".
-  CVE-2026-109619 "php2shell"  stale global state via session.upload_progress.
-                               Small multipart request (~450 bytes) with
-                               PHPSESSID as a form field and a filename holding
-                               <?php or serialized-object syntax.
+CVE-2026-109618 "rawkey"     OOM while parsing $_POST, triggered by a huge
+                             field name (>1 MB, urlencoded or multipart).
+                             Error log signature:
+                             "Allowed memory size ... in Unknown on line 0".
+CVE-2026-109619 "php2shell"  stale global state via session.upload_progress.
+                             Small multipart request (~450 bytes) with
+                             PHPSESSID as a form field and a filename holding
+                             <?php or serialized-object syntax.
 
 Access logs don't store request bodies, so most of the detection is indirect:
 User-Agent, published source IPs, status codes, POST bursts, PHP errors during
@@ -25,8 +26,9 @@ Read-only. Run as root. Python 3.6+, standard library only.
 
 Examples:
   ./php2shell_hunt.py
-  ./php2shell_hunt.py --since 2026-10-01 --deep --json report.json
-  ./php2shell_hunt.py --sites example.com web12 --ioc 203.0.113.7 --ioc "odd string"
+  ./php2shell_hunt.py --env cpanel --since 2026-10-01 --deep --json report.json
+  ./php2shell_hunt.py --env single --www /var/www/html --logs /var/log/nginx
+  ./php2shell_hunt.py --sites example.com web12 --ioc 203.0.113.7 --md report.md
 
 Exit code: 2 if there are CRIT/HIGH findings, 1 if the worst is MED, 0 otherwise.
 """
@@ -55,16 +57,13 @@ SEVERITIES = ['INFO', 'LOW', 'MED', 'HIGH', 'CRIT']
 SEV_RANK = {s: i for i, s in enumerate(SEVERITIES)}
 SEV_WEIGHT = {'INFO': 0, 'LOW': 1, 'MED': 3, 'HIGH': 10, 'CRIT': 50}
 
-
 def bump(sev):
     """Raise severity one level (used for bursts)."""
     return SEVERITIES[min(SEV_RANK[sev] + 1, len(SEVERITIES) - 1)]
 
-
 class Rule(object):
     """Per-line signature. On each line the first matching rule wins."""
     __slots__ = ('id', 'sev', 'rx', 'desc', 'burst')
-
     def __init__(self, rid, sev, pattern, desc, burst=False):
         self.id = rid
         self.sev = sev
@@ -72,38 +71,126 @@ class Rule(object):
         self.desc = desc
         self.burst = burst  # True: a burst raises severity one level
 
+# ---------------------------------------------------------------------------
+# Environment profiles
+# ---------------------------------------------------------------------------
+ENV_PROFILES = {
+    'ispconfig': {
+        'www_default': '/var/www',
+        'site_globs': ['*', 'clients/client*/web*'],
+        'log_subdir': 'log',
+        'web_subdir': 'web',
+        'tmp_subdir': 'tmp',
+        'global_logs': [
+            ('_global', '/var/log/apache2/*'),
+            ('_global', '/var/log/httpd/*'),
+            ('_global', '/var/log/nginx/*'),
+            ('_global', '/var/log/php*-fpm.log*'),
+            ('_global', '/var/log/php*/*'),
+            ('_global', '/var/log/php-fpm/*'),
+            ('_global', '/opt/php*/var/log/*'),
+            ('_ispconfig', '/var/log/ispconfig/httpd/*/*'),
+            ('_system', '/var/log/kern.log*'),
+            ('_system', '/var/log/syslog*'),
+            ('_system', '/var/log/messages*'),
+        ],
+        'session_globs': ['/var/lib/php/sessions', '/var/lib/php*/sessions',
+                          '/opt/php*/var/lib/php/sessions'],
+        'web_user_re': r'^(?:web\d+|www-data|apache|nginx|httpd|wwwrun)$',
+        'cron_note': 'ISPConfig puts its own cron jobs in /etc/cron.d/ispc_*',
+    },
+    'cpanel': {
+        'www_default': '/home',
+        'site_globs': ['*'],
+        'log_subdir': None,
+        'web_subdir': 'public_html',
+        'tmp_subdir': 'tmp',
+        'global_logs': [
+            ('_global', '/usr/local/apache/logs/*'),
+            ('_global', '/usr/local/apache/domlogs/*'),
+            ('_global', '/var/log/httpd/*'),
+            ('_global', '/var/log/nginx/*'),
+            ('_global', '/var/cpanel/php-fpm/*/logs/*'),
+            ('_global', '/opt/cpanel/ea-php*/root/var/log/php-fpm/*'),
+            ('_cpanel', '/usr/local/cpanel/logs/*'),
+            ('_system', '/var/log/kern.log*'),
+            ('_system', '/var/log/syslog*'),
+            ('_system', '/var/log/messages*'),
+            ('_system', '/var/log/secure*'),
+        ],
+        'session_globs': ['/var/cpanel/php/sessions/*', '/tmp'],
+        'web_user_re': r'^(?:nobody|cpanel|cpsess)$',
+        'cron_note': 'cPanel user crontabs',
+    },
+    'directadmin': {
+        'www_default': '/home',
+        'site_globs': ['*/domains/*'],
+        'log_subdir': None,
+        'web_subdir': 'public_html',
+        'tmp_subdir': None,
+        'global_logs': [
+            ('_global', '/var/log/httpd/domains/*'),
+            ('_global', '/var/log/nginx/domains/*'),
+            ('_global', '/var/log/httpd/*'),
+            ('_global', '/var/log/nginx/*'),
+            ('_directadmin', '/var/log/directadmin/*'),
+            ('_system', '/var/log/kern.log*'),
+            ('_system', '/var/log/syslog*'),
+            ('_system', '/var/log/messages*'),
+        ],
+        'session_globs': ['/tmp'],
+        'web_user_re': r'^(?:apache|nginx|webapps|access)$',
+        'cron_note': 'DirectAdmin user crontabs',
+    },
+    'single': {
+        'www_default': '/var/www',
+        'site_globs': ['*'],
+        'log_subdir': None,
+        'web_subdir': '',
+        'tmp_subdir': None,
+        'global_logs': [
+            ('_global', '/var/log/apache2/*'),
+            ('_global', '/var/log/httpd/*'),
+            ('_global', '/var/log/nginx/*'),
+            ('_global', '/var/log/php*-fpm.log*'),
+            ('_global', '/var/log/php*/*'),
+            ('_global', '/var/log/php-fpm/*'),
+            ('_system', '/var/log/kern.log*'),
+            ('_system', '/var/log/syslog*'),
+            ('_system', '/var/log/messages*'),
+        ],
+        'session_globs': ['/var/lib/php/sessions', '/var/lib/php*/sessions', '/tmp'],
+        'web_user_re': r'^(?:www-data|apache|nginx|httpd|wwwrun|nobody)$',
+        'cron_note': 'web user crontabs',
+    },
+}
+
+FALLBACK_WEB_ROOTS = ['/var/www', '/home', '/srv', '/opt']
+FALLBACK_LOG_DIRS = ['/var/log/apache2', '/var/log/httpd', '/var/log/nginx',
+                     '/var/log']
 
 # ---------------------------------------------------------------------------
 # Signatures
 # ---------------------------------------------------------------------------
-# Direct indicators of the exploit, or of a WAF that already caught it. Applied to
-# every log, access logs included (the User-Agent is on the line).
 COMMON_RULES = [
     Rule('WAF_PHP2SHELL', 'HIGH',
          r'ModSecurity.*(?:php2shell|rawkey|php-gh11189)|id "3[12]0100\d"',
          'WAF rule for PHP2Shell/rawkey fired'),
-    # C2/staging hosts and domains from the Ellio honeypot report (Mirai loader, booter)
     Rule('IOC_C2', 'CRIT',
          r'(?<![\d.])(?:15\.235\.206\.16|92\.118\.112\.100|134\.199\.154\.64|117\.55\.202\.115|'
          r'150\.251\.112\.208)(?![\d.])|godofthunder\.st|botlesscucks\.st|gettingheadfromduckysmom\.st|'
          r'jackalsyn\.com',
          'PHP2Shell C2/staging host or domain (Ellio, phpup-2026)'),
-    # UAs and markers seen in the wild: php2shell-scan/109618, php2shell-verify/1.0,
-    # php-session-startup-rce-poc, B8RAT/1.0 (OffSeq, Ellio); rawkey-rce and
-    # coalition-scanner-rawkey are not in any public report yet
     Rule('IOC_STRING', 'CRIT',
          r'rawkey|coalition-scanner|php2shell|php-session-startup-rce-poc|B8RAT/|'
          r'PHP2SHELL_OK|JACKALPOC|P2SMA?R?K',
          'Exploit/scanner string (UA, boundary or marker used by PHP2Shell tooling)'),
-    # multipart boundaries of public tooling; only visible in ModSecurity audit logs
     Rule('IOC_BOUNDARY', 'HIGH',
          r'boundary=-{2,8}p2s|-{4,8}p2s(?:hell)?[0-9a-f]{6,}|--nucleiBoundary|boundary=-{4,8}atk\b',
          'Multipart boundary used by PHP2Shell tooling (needs a body-logging WAF)'),
 ]
 
-# Apache/nginx error logs, PHP/PHP-FPM logs and system logs.
 LOG_RULES = COMMON_RULES + [
-    # CVE-2026-109618: the OOM happens before any script runs
     Rule('OOM_UNKNOWN', 'CRIT',
          r'(?:Allowed memory size of \d+ bytes exhausted|Out of memory).{0,300}in Unknown on line 0|'
          r'PHP Request Startup:.{0,40}(?:Allowed memory size of \d+ bytes exhausted|Out of memory)|'
@@ -112,8 +199,6 @@ LOG_RULES = COMMON_RULES + [
     Rule('TIMEOUT_UNKNOWN', 'HIGH',
          r'Maximum execution time of \d+ seconds? exceeded.{0,200}in Unknown on line',
          'Timeout outside script execution (request startup/shutdown)', True),
-
-    # memory corruption and crashes
     Rule('HEAP_CORRUPTION', 'HIGH',
          r'zend_mm_heap corrupted|double free or corruption|free\(\): invalid|'
          r'malloc\(\): (?:corrupted|invalid|unaligned|memory corruption)|'
@@ -133,8 +218,6 @@ LOG_RULES = COMMON_RULES + [
     Rule('FPM_SIGKILL', 'MED',
          r'child \d+ exited on signal 9\b',
          'PHP-FPM worker got SIGKILL (OOM killer or request_terminate_timeout)', True),
-
-    # system: OOM killer, segfaults seen by the kernel, systemd
     Rule('OOM_KILL_WEB', 'HIGH',
          r'(?:Out of memory: Killed process \d+ \(|oom-kill:.*task=)(?:php|apache2|httpd|lsphp|nginx)',
          'OOM killer killed a PHP/web process', True),
@@ -150,17 +233,10 @@ LOG_RULES = COMMON_RULES + [
          'systemd: Apache/PHP-FPM crash or unclean restart', True),
     Rule('OOM_KILL_OTHER', 'LOW', r'Out of memory: Killed process|oom-kill:',
          'OOM killer (other process)', True),
-
-    # anomalous requests seen by PHP or the web server
-    # A session can only start before any script runs through the upload_progress
-    # callback. "cannot be sent" means output (usually a displayed startup warning)
-    # went out first. Seen in the hackplayers.com writeup of the CVE-2026-109619 chain.
     Rule('STARTUP_SESSION', 'HIGH',
          r'(?:PHP Request Startup|Unknown): Session (?:cookie|cache limiter) cannot be sent|'
          r'Session (?:cookie|cache limiter) cannot be sent.{0,300}in Unknown on line 0',
          'Session started during request startup (upload_progress path, CVE-2026-109619)', True),
-    # session file named after multipart boundary junk: the PHPSESSID came from the body
-    # (SigmaHQ php2shell rule, "sess_" + "/ndary=")
     Rule('SESS_ID_BOUNDARY', 'CRIT', r'sess_\S{0,200}ndary=',
          'Session file name holds multipart boundary text (session ID taken from the body)'),
     Rule('SESSION_DECODE_STARTUP', 'HIGH',
@@ -213,8 +289,6 @@ LOG_RULES = COMMON_RULES + [
          'PHP Fatal error', True),
     Rule('FPM_MAX_CHILDREN', 'LOW', r'reached (?:pm\.)?max_children',
          'PHP-FPM pool saturated', True),
-
-    # starts, stops and restarts (context for the timeline)
     Rule('APACHE_RESTART', 'INFO',
          r'AH00163|AH00169|AH00171|AH00493|AH00494|caught SIGTERM, shutting down|Graceful restart requested',
          'Apache start/stop/restart'),
@@ -231,19 +305,13 @@ LOG_RULES = COMMON_RULES + [
 # Rules correlated per client IP in Hunter.finalize()
 CORR_ANCHORS = {'INPUT_VARS', 'OOM_UNKNOWN'}
 CORR_RULES = CORR_ANCHORS | {'STARTUP_SESSION', 'SESSION_DECODE_STARTUP', 'SESS_ID_ILLEGAL_STARTUP',
-                             'SESS_ID_BOUNDARY'}
+                              'SESS_ID_BOUNDARY'}
 
-# Source IPs published as PHP2Shell senders (AWS MadPot, OffSeq, Ellio, Oct 2026). Most are
-# VPS, cloud or anonymisation exits shared with other traffic: a hit means "look closer",
-# not "compromised".
 KNOWN_SOURCE_IPS = {
-    # AWS MadPot (103.216.220.92 was seen on 2026-10-17, before disclosure)
     '103.216.220.92', '31.223.184.166', '37.19.200.5', '134.209.159.64', '103.114.163.188',
     '95.217.98.37',
-    # OffSeq Mirage
     '94.154.43.7', '38.180.45.91', '80.66.66.66', '217.60.242.76', '87.192.237.19',
     '34.19.34.88', '34.76.232.95', '34.76.218.47', '194.42.196.44',
-    # Ellio
     '45.198.224.169', '92.118.112.100', '152.233.51.47', '146.70.202.189', '185.5.70.233',
     '176.65.132.128', '122.97.242.167', '192.140.154.1', '47.238.232.123', '31.182.51.55',
     '98.80.11.91', '200.119.44.50', '45.136.71.89', '34.136.122.211', '77.237.246.73',
@@ -266,8 +334,6 @@ WEBSHELL_PARAM_RE = re.compile(
 UPLOAD_PHP_RE = re.compile(
     r'/(?:wp-content/uploads|uploads?|files|images|media)/[^?#]*\.(?:php\d?|phtml|phar|pht)(?:[?#/]|$)', re.I)
 SESSION_IN_URL_RE = re.compile(r'[?&](?:PHPSESSID|PHP_SESSION_UPLOAD_PROGRESS)=', re.I)
-
-# Client IP in error logs: Apache "[client 1.2.3.4:5678]", nginx "client: 1.2.3.4"
 CLIENT_RE = re.compile(r'(\[client |client: |\[remote )([0-9A-Fa-f:.]+)')
 
 # ---------------------------------------------------------------------------
@@ -279,15 +345,11 @@ SUSP_CODE_RE = re.compile(
     rb'eval\s*\(|base64_decode\s*\(|gzinflate\s*\(|str_rot13\s*\(|assert\s*\(|'
     rb'shell_exec\s*\(|passthru\s*\(|\bsystem\s*\(|proc_open\s*\(|popen\s*\(', re.I)
 SESS_PHP_RE = re.compile(rb'<\?(?:php\b|=)', re.I)
-# progress values / markers left by public tooling inside session files
 SESS_MARKER_RE = re.compile(
     rb'P2SMA?R?K|POC_[0-9a-f]{8}|nuclei-probe|JACKALPOC|PHP2SHELL_OK|\|x\|i:1;|'
     rb'shell_upload|phtml_test|php5_test|dbl_test')
-# session IDs used by public PoCs
 SESS_NAME_RE = re.compile(r'^sess_(?:leaksessionid\d*|attacksessionid\d*|nuclei.*|.*ndary=.*)$', re.I)
-# webshell dropped in the wild (Ellio): "Code by Bin", rootkit.net.cn, z-cg.com
 KNOWN_WEBSHELL_RE = re.compile(rb'Code by Bin|rootkit\.net\.cn|z-cg\.com')
-# SHA-256 of published samples (Ellio, phpup-2026)
 KNOWN_SHA256 = {
     '0c5486f06620e26e316f4b33f318b0d646d5e1133789331aa2fed012360d1486': 'Mirai-style loader (nfs)',
     '7133612558a5d0f257ca6bdb4f765453af9465bc5298acdcf33b5761b8c59aac': 'booter',
@@ -295,28 +357,17 @@ KNOWN_SHA256 = {
     'dd98bf48899aa385035352688357742c73ddc5e47ec4ecc7d7b74c53c2e3ca3d': 'Go agent',
     '0c254d547cac650bfbcb2275e30c2083737520a51a0511646f1fbb7ed60a0d63': 'php-up-2026 PoC archive',
 }
-# paths written by the loader seen in the wild
 KNOWN_DROP_PATHS = ['/tmp/nfs', '/dev/shm/.cache.so', '/var/tmp/nfs']
 TMP_DIRS = ['/tmp', '/var/tmp', '/dev/shm']
-WEB_USER_RE = re.compile(r'^(?:web\d+|www-data|apache|nginx|httpd|wwwrun)$')
 AUTO_PREPEND_RE = re.compile(r'auto_(?:prepend|append)_file', re.I)
-
 SKIP_FILE_RE = re.compile(
     r'^(?:wtmp|btmp|lastlog|faillog)|\.(?:journal~?|pid|sock|db|zst|lz4)$', re.I)
 
-GLOBAL_LOG_GLOBS = [
-    ('_global', '/var/log/apache2/*'),
-    ('_global', '/var/log/httpd/*'),
-    ('_global', '/var/log/nginx/*'),
-    ('_global', '/var/log/php*-fpm.log*'),
-    ('_global', '/var/log/php*/*'),
-    ('_global', '/var/log/php-fpm/*'),
-    ('_global', '/opt/php*/var/log/*'),       # extra PHP versions built by ISPConfig
-    ('_ispconfig', '/var/log/ispconfig/httpd/*/*'),
-    ('_system', '/var/log/kern.log*'),
-    ('_system', '/var/log/syslog*'),
-    ('_system', '/var/log/messages*'),
-]
+# Reverse shell patterns in /proc/*/cmdline
+REVSHELL_RE = re.compile(
+    r'/dev/tcp/|/dev/udp/|fsockopen|nc\s+-[elp]|ncat\s+-[elp]|socat.*exec:|'
+    r'bash\s+-i\s+>&|sh\s+-i\s+>&|python[23]?\s+-c\s+.*socket|'
+    r'perl\s+-e\s+.*socket|ruby\s+-rsocket|php\s+-r\s+.*fsockopen', re.I)
 
 PHP_BIN_GLOBS = ['/usr/bin/php*', '/usr/sbin/php-fpm*', '/usr/local/bin/php*',
                  '/usr/local/sbin/php-fpm*', '/opt/php*/bin/php', '/opt/php*/sbin/php-fpm',
@@ -335,9 +386,7 @@ TS_PHP = re.compile(r'\[(\d{1,2})-(\w{3})-(\d{4}) (\d{2}):(\d{2}):(\d{2})')
 TS_ISO = re.compile(r'(\d{4})[-/](\d{2})[-/](\d{2})[T ](\d{2}):(\d{2}):(\d{2})(?:[.,]\d+)?(Z|[+-]\d{2}:?\d{2})?')
 TS_SYSLOG = re.compile(r'(\w{3}) +(\d{1,2}) (\d{2}):(\d{2}):(\d{2}) ')
 
-
 def _epoch(y, mo, d, h, mi, s, tz=None):
-    """Convert to epoch. Without tz, server local time is assumed."""
     try:
         dt = datetime(y, mo, d, h, mi, s)
     except ValueError:
@@ -352,7 +401,6 @@ def _epoch(y, mo, d, h, mi, s, tz=None):
         return (dt - datetime(1970, 1, 1)).total_seconds() - off
     return time.mktime(dt.timetuple())
 
-
 def parse_clf(s):
     m = TS_CLF.match(s)
     if not m or m.group(2) not in MONTHS:
@@ -360,9 +408,7 @@ def parse_clf(s):
     return _epoch(int(m.group(3)), MONTHS[m.group(2)], int(m.group(1)),
                   int(m.group(4)), int(m.group(5)), int(m.group(6)), m.group(7))
 
-
 def parse_ts(line):
-    """Timestamp of a log line in any of the usual formats."""
     head = line[:200]
     m = TS_APACHE.search(head)
     if m and m.group(1) in MONTHS:
@@ -380,7 +426,7 @@ def parse_ts(line):
         now = datetime.now()
         ts = _epoch(now.year, MONTHS[m.group(1)], int(m.group(2)),
                     int(m.group(3)), int(m.group(4)), int(m.group(5)))
-        if ts and ts > time.time() + 86400:  # classic syslog has no year
+        if ts and ts > time.time() + 86400:
             ts = _epoch(now.year - 1, MONTHS[m.group(1)], int(m.group(2)),
                         int(m.group(3)), int(m.group(4)), int(m.group(5)))
         return ts
@@ -389,20 +435,16 @@ def parse_ts(line):
         return parse_clf(head[m.start():])
     return None
 
-
 def fmt_ts(ts):
     return datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M:%S') if ts else '?'
 
-
 def max_window(sorted_ts, window):
-    """Max number of events inside any sliding window of `window` seconds."""
     best = j = 0
     for i, t in enumerate(sorted_ts):
         while t - sorted_ts[j] > window:
             j += 1
         best = max(best, i - j + 1)
     return best
-
 
 # ---------------------------------------------------------------------------
 # I/O helpers
@@ -416,7 +458,6 @@ def open_log(path):
         return lzma.open(path, 'rt', encoding='utf-8', errors='replace')
     return open(path, 'r', encoding='utf-8', errors='replace')
 
-
 def read_head(path, limit=262144):
     try:
         with open(path, 'rb') as fh:
@@ -424,46 +465,38 @@ def read_head(path, limit=262144):
     except (OSError, IOError):
         return b''
 
-
 def client_ip(line):
     m = CLIENT_RE.search(line)
     if not m:
         return None
     s = m.group(2).rstrip(':.')
-    if '.' in s and s.count(':') == 1:          # IPv4:port
+    if '.' in s and s.count(':') == 1:
         return s.split(':')[0]
     if m.group(1) == '[client ' and s.count(':') > 1:
-        head, _, tail = s.rpartition(':')       # Apache appends :port to IPv6 too
+        head, _, tail = s.rpartition(':')
         if tail.isdigit() and head:
             return head
     return s
 
-
 def classify(path):
-    """'access', 'log' or None (skip)."""
     name = os.path.basename(path).lower()
     if SKIP_FILE_RE.search(name):
         return None
     return 'access' if 'access' in name else 'log'
 
-
 class Colors(object):
     CODES = {'CRIT': '\033[1;41;97m', 'HIGH': '\033[1;31m', 'MED': '\033[33m',
              'LOW': '\033[36m', 'INFO': '\033[2m', 'B': '\033[1m', 'D': '\033[2m', 'R': '\033[0m'}
-
     def __init__(self, enabled):
         self.on = enabled
-
     def __call__(self, key, text):
         return '%s%s%s' % (self.CODES[key], text, self.CODES['R']) if self.on else text
-
 
 # ---------------------------------------------------------------------------
 # Findings accumulator
 # ---------------------------------------------------------------------------
 class Agg(object):
     __slots__ = ('sev', 'desc', 'burst', 'count', 'ts', 'ips', 'samples', 'maxw', 'bursted')
-
     def __init__(self, sev, desc, burst):
         self.sev, self.desc, self.burst = sev, desc, burst
         self.count = 0
@@ -473,27 +506,25 @@ class Agg(object):
         self.maxw = 0
         self.bursted = False
 
-
 class Hunter(object):
-    def __init__(self, args):
+    def __init__(self, args, profile):
         self.a = args
+        self.profile = profile
         self.since = args.since_epoch
-        self.aggs = {}                      # (site, rule_id) -> Agg
-        self.post_ts = defaultdict(list)    # ip -> [ts of POST/PUT/PATCH]
+        self.aggs = {}
+        self.post_ts = defaultdict(list)
         self.post_sites = defaultdict(set)
         self.seen_files = set()
         self.files_scanned = 0
         self.lines_scanned = 0
         self.req_bytes_seen = False
         self.warnings = []
-        self.corr = defaultdict(list)       # ip -> [(ts, rule_id, site, where, text)] for CORR_RULES
-        self.post_5xx = defaultdict(list)   # ip -> [(ts, status, site, where, line)] POSTs answered 5xx
+        self.corr = defaultdict(list)
+        self.post_5xx = defaultdict(list)
 
         extra = self._ioc_rules()
         self.access_rules = extra + COMMON_RULES
         self.log_rules = extra + LOG_RULES
-        # prefilter: one regex with every signature; only on a hit do we walk
-        # the rules one by one to find out which one it was
         self.access_pre = re.compile('|'.join('(?:%s)' % r.rx.pattern for r in self.access_rules), re.I)
         self.log_pre = re.compile('|'.join('(?:%s)' % r.rx.pattern for r in self.log_rules), re.I)
 
@@ -508,8 +539,8 @@ class Hunter(object):
         parts = []
         for x in iocs:
             p = re.escape(x)
-            if re.fullmatch(r'[0-9A-Fa-f:.]+', x):   # IP: avoid 1.2.3.4 inside 11.2.3.45
-                p = r'(?<![\w.:])%s(?![\w.])' % p    # trailing ":" is fine (IP:port)
+            if re.fullmatch(r'[0-9A-Fa-f:.]+', x):
+                p = r'(?<![\w.:])%s(?![\w.])' % p
             parts.append(p)
         return [Rule('IOC_CUSTOM', 'HIGH', '|'.join(parts), 'User-supplied IOC')]
 
@@ -552,7 +583,7 @@ class Hunter(object):
             try:
                 for n, line in enumerate(fh, 1):
                     yield n, line.rstrip('\n')
-            except Exception as e:  # truncated gzip, corrupt xz, etc.
+            except Exception as e:
                 self.warn('read aborted in %s: %s' % (path, e))
 
     def scan_file(self, site, path, kind):
@@ -566,7 +597,7 @@ class Hunter(object):
             self.warn('stat %s: %s' % (path, e))
             return
         if st.st_size == 0 or (self.since and st.st_mtime < self.since):
-            return  # empty, or nothing newer than --since
+            return
         self.files_scanned += 1
         if self.a.verbose:
             print('  %-8s %s (%d KB)' % (kind, path, st.st_size // 1024), file=sys.stderr)
@@ -607,7 +638,6 @@ class Hunter(object):
                                 False, ts, ip, '%s:%d' % (label, lineno), line)
 
     def check_access(self, site, where, line, m, ts, ip):
-        """Structural heuristics on an already parsed access log line."""
         req = m.group('req')
         status = int(m.group('status'))
         rm = REQ_LINE_RE.match(req)
@@ -615,35 +645,34 @@ class Hunter(object):
             method, uri = rm.group(1), rm.group(2)
         else:
             method, uri = None, ''
-            if not (req == '-' and status == 408):  # 408 with "-" = browser preconnect
-                self.record(site, 'ACC_MALFORMED', 'LOW', 'Malformed or binary request line',
-                            True, ts, ip, where, line)
-
+        if not (req == '-' and status == 408):
+            self.record(site, 'ACC_MALFORMED', 'LOW', 'Malformed or binary request line',
+                        True, ts, ip, where, line)
         if method in BODY_METHODS:
             if ip and ts is not None:
                 self.post_ts[ip].append(ts)
                 self.post_sites[ip].add(site)
-                if status >= 500:
-                    self.post_5xx[ip].append((ts, status, site, where, line))
-            ua = m.group('ua') or ''
-            if ua.startswith('fasthttp'):
-                self.record(site, 'ACC_FASTHTTP_POST', 'MED',
-                            'POST with the fasthttp UA (used by the 1 MB memory-pressure cluster, OffSeq)',
+            if status >= 500:
+                self.post_5xx[ip].append((ts, status, site, where, line))
+        ua = m.group('ua') or ''
+        if ua.startswith('fasthttp'):
+            self.record(site, 'ACC_FASTHTTP_POST', 'MED',
+                        'POST with the fasthttp UA (used by the 1 MB memory-pressure cluster, OffSeq)',
+                        True, ts, ip, where, line)
+        if status in REJECT_STATUS:
+            self.record(site, 'ACC_POST_REJECTED', 'MED',
+                        'POST/PUT rejected by the server (400/411/413/415/417/431)',
+                        True, ts, ip, where, line)
+        elif status >= 500:
+            self.record(site, 'ACC_POST_5XX', 'LOW', 'POST/PUT answered with 5xx',
+                        True, ts, ip, where, line)
+        rin = m.group('rin')
+        if rin is not None:
+            self.req_bytes_seen = True
+            if int(rin) >= self.a.big_post:
+                self.record(site, 'ACC_BIG_POST', 'MED',
+                            'POST of %d bytes or more (%%I field in LogFormat)' % self.a.big_post,
                             True, ts, ip, where, line)
-            if status in REJECT_STATUS:
-                self.record(site, 'ACC_POST_REJECTED', 'MED',
-                            'POST/PUT rejected by the server (400/411/413/415/417/431)',
-                            True, ts, ip, where, line)
-            elif status >= 500:
-                self.record(site, 'ACC_POST_5XX', 'LOW', 'POST/PUT answered with 5xx',
-                            True, ts, ip, where, line)
-            rin = m.group('rin')
-            if rin is not None:
-                self.req_bytes_seen = True
-                if int(rin) >= self.a.big_post:
-                    self.record(site, 'ACC_BIG_POST', 'MED',
-                                'POST of %d bytes or more (%%I field in LogFormat)' % self.a.big_post,
-                                True, ts, ip, where, line)
         if uri:
             if WEBSHELL_PARAM_RE.search(uri):
                 self.record(site, 'ACC_WEBSHELL_PARAM', 'MED',
@@ -660,17 +689,40 @@ class Hunter(object):
 
     # -- discovery -------------------------------------------------------
     def discover_sites(self):
-        """[(name, real root, log dir)] for every ISPConfig site."""
+        """[(name, real root, log dir)] adapted to the environment profile."""
         sites, seen = [], set()
         www = self.a.www
-        for pat in (os.path.join(www, '*'), os.path.join(www, 'clients', 'client*', 'web*')):
-            for d in sorted(glob.glob(pat)):
-                logdir = os.path.join(d, 'log')
-                if not os.path.isdir(logdir):
+        p = self.profile
+
+        if self.a.logs:
+            # User specified log dirs manually: one pseudo-site per dir
+            for ld in self.a.logs:
+                ld = os.path.realpath(ld)
+                if os.path.isdir(ld) and ld not in seen:
+                    seen.add(ld)
+                    sites.append((os.path.basename(ld) or '_logs', www, ld))
+            return sites
+
+        if self.a.env == 'single':
+            if os.path.isdir(www):
+                sites.append(('_single', os.path.realpath(www), None))
+            return sites
+
+        for sg in p['site_globs']:
+            for d in sorted(glob.glob(os.path.join(www, sg))):
+                if not os.path.isdir(d):
                     continue
                 root = os.path.realpath(d)
                 if root in seen:
                     continue
+
+                if p['log_subdir']:
+                    logdir = os.path.join(d, p['log_subdir'])
+                    if not os.path.isdir(logdir):
+                        continue
+                else:
+                    logdir = None
+
                 seen.add(root)
                 name = os.path.relpath(d, www)
                 if self.a.sites and not ({name, os.path.basename(d), os.path.basename(root)}
@@ -681,6 +733,8 @@ class Hunter(object):
 
     def scan_sites(self, sites):
         for name, _root, logdir in sites:
+            if not logdir:
+                continue
             try:
                 entries = sorted(os.listdir(logdir))
             except OSError as e:
@@ -693,11 +747,16 @@ class Hunter(object):
                     self.scan_file(name, path, kind)
 
     def scan_global(self):
-        for site, pat in GLOBAL_LOG_GLOBS:
+        log_globs = list(self.profile['global_logs'])
+        if self.a.logs:
+            for ld in self.a.logs:
+                log_globs.append(('_custom', os.path.join(ld, '*')))
+
+        for site, pat in log_globs:
             for path in sorted(glob.glob(pat)):
                 if not os.path.isfile(path):
                     continue
-                if site == '_ispconfig':
+                if site.startswith('_') and site not in ('_global', '_system', '_journal', '_custom'):
                     parent = os.path.basename(os.path.dirname(path))
                     if self.a.sites and parent not in self.a.sites:
                         continue
@@ -714,8 +773,8 @@ class Hunter(object):
         since = self.a.since_dt or (datetime.now() - timedelta(days=30))
         base = ['journalctl', '--no-pager', '-q', '-o', 'short-iso',
                 '--since', since.strftime('%Y-%m-%d %H:%M:%S')]
-        cmds = [base + ['-u', 'apache2*', '-u', 'httpd*', '-u', 'php*fpm*', '-u', 'nginx*']]
-        # kernel only when there is no kern.log/messages (avoids double counting)
+        cmds = [base + ['-u', 'apache2*', '-u', 'httpd*', '-u', 'php*fpm*', '-u', 'nginx*',
+                        '-u', 'lsphp*', '-u', 'lsws*']]
         if not (glob.glob('/var/log/kern.log*') or glob.glob('/var/log/messages*')):
             cmds.append(base + ['_TRANSPORT=kernel'])
         for cmd in cmds:
@@ -730,31 +789,66 @@ class Hunter(object):
                             ((n, l.rstrip('\n')) for n, l in enumerate(p.stdout, 1)), 'log')
             p.wait()
 
+    def scan_fallback(self):
+        """When the expected panel layout is missing, walk common locations."""
+        self.warn('expected layout not found, falling back to recursive search')
+        seen = set()
+        for d in FALLBACK_LOG_DIRS:
+            rd = os.path.realpath(d)
+            if os.path.isdir(rd) and rd not in seen:
+                seen.add(rd)
+                for dirpath, _dirs, files in os.walk(rd):
+                    for fn in files:
+                        path = os.path.join(dirpath, fn)
+                        kind = classify(path)
+                        if kind and os.path.isfile(path):
+                            self.scan_file('_fallback', path, kind)
+        for d in FALLBACK_WEB_ROOTS:
+            rd = os.path.realpath(d)
+            if os.path.isdir(rd) and rd not in seen:
+                seen.add(rd)
+                self.walk_webroot('_fallback', rd)
+
     # -- --deep ------------------------------------------------------------
     def deep_scan(self, sites):
+        p = self.profile
+        web_user_re = re.compile(p['web_user_re'])
+
         for name, root, _ in sites:
-            web = os.path.join(root, 'web')
+            if p['web_subdir']:
+                web = os.path.join(root, p['web_subdir'])
+            else:
+                web = root
             self.walk_webroot(name, web if os.path.isdir(web) else root)
-            tmp = os.path.join(root, 'tmp')   # ISPConfig: the site's session.save_path and upload_tmp_dir
-            if os.path.isdir(tmp):
-                self.scan_tmp(name, tmp)
+
+            if p['tmp_subdir']:
+                tmp = os.path.join(root, p['tmp_subdir'])
+                if os.path.isdir(tmp):
+                    self.scan_tmp(name, tmp)
+
             ak = os.path.join(root, '.ssh', 'authorized_keys')
             if self.since and os.path.isfile(ak) and os.path.getmtime(ak) >= self.since:
                 self.record(name, 'DEEP_AUTHKEYS', 'MED', 'Site authorized_keys modified inside the window',
                             False, os.path.getmtime(ak), None, ak, 'mtime ' + fmt_ts(os.path.getmtime(ak)))
+
         if not self.a.sites:
             seen = set()
-            for d in (['/var/lib/php/sessions'] + glob.glob('/var/lib/php*/sessions')
-                      + glob.glob('/opt/php*/var/lib/php/sessions')):
-                rd = os.path.realpath(d)
-                if os.path.isdir(rd) and rd not in seen:
-                    seen.add(rd)
-                    self.scan_tmp('_sessions', rd)
+            for sg in p['session_globs']:
+                for d in glob.glob(sg):
+                    rd = os.path.realpath(d)
+                    if os.path.isdir(rd) and rd not in seen:
+                        seen.add(rd)
+                        self.scan_tmp('_sessions', rd)
             for f in glob.glob('/tmp/sess_*'):
                 self.check_session('_sessions', f)
-            self.scan_crontabs()
-            self.scan_system_tmp()
-            self.scan_memfd()
+
+        self.scan_crontabs(web_user_re)
+        self.scan_system_tmp(web_user_re)
+        self.scan_memfd(web_user_re)
+        self.scan_proc_cmdline()
+        self.scan_ld_preload()
+        self.scan_uid0()
+        self.scan_shell_rc(web_user_re)
 
     def walk_webroot(self, site, web):
         for dirpath, _dirs, files in os.walk(web):
@@ -767,6 +861,15 @@ class Hunter(object):
                     self.check_ini(site, full)
                     continue
                 if not PHP_EXT_RE.search(low):
+                    # ELF binaries inside the webroot
+                    if read_head(full, 4) == b'\x7fELF':
+                        try:
+                            mt = os.path.getmtime(full)
+                        except OSError:
+                            mt = None
+                        self.record(site, 'DEEP_ELF_WEBROOT', 'HIGH',
+                                    'ELF binary inside the webroot',
+                                    False, mt, None, full, 'mtime ' + fmt_ts(mt))
                     continue
                 try:
                     st = os.lstat(full)
@@ -813,7 +916,6 @@ class Hunter(object):
                                 False, mtime, None, full, 'mtime ' + fmt_ts(mtime))
 
     def known_hash(self, path, st=None, limit=16 << 20):
-        """Name of the published sample if the file's SHA-256 matches, else None."""
         try:
             st = st or os.lstat(path)
             if not os.path.isfile(path) or st.st_size > limit:
@@ -826,8 +928,7 @@ class Hunter(object):
         except (OSError, IOError):
             return None
 
-    def scan_system_tmp(self):
-        """Known drop paths, ELF files owned by web users in /tmp-like dirs, hash matches."""
+    def scan_system_tmp(self, web_user_re):
         import pwd
         for pth in KNOWN_DROP_PATHS:
             if os.path.lexists(pth):
@@ -853,23 +954,22 @@ class Hunter(object):
                         self.record('_system', 'DEEP_KNOWN_HASH', 'CRIT',
                                     'File matches a published PHP2Shell sample hash',
                                     False, st.st_mtime, None, full, '%s, owner %s' % (name, owner))
-                    elif WEB_USER_RE.match(owner) and read_head(full, 4) == b'\x7fELF':
+                    elif web_user_re.match(owner) and read_head(full, 4) == b'\x7fELF':
                         self.record('_system', 'DEEP_WEB_ELF_TMP', 'HIGH',
                                     'ELF binary owned by a web user in a temp dir',
                                     False, st.st_mtime, None, full,
                                     'owner %s, %d bytes, mtime %s' % (owner, st.st_size, fmt_ts(st.st_mtime)))
 
-    def scan_memfd(self):
-        """Running processes executed from memfd (fileless), typical after RCE."""
+    def scan_memfd(self, web_user_re):
         for exe in glob.glob('/proc/[0-9]*/exe'):
             try:
                 target = os.readlink(exe)
             except OSError:
                 continue
             if target.startswith('/memfd:runc'):
-                continue    # runc re-execs itself from memfd on container hosts
+                continue
             if target.startswith('/memfd:') or ('(deleted)' in target and
-                                                 target.startswith(('/tmp/', '/dev/shm/', '/var/tmp/'))):
+                target.startswith(('/tmp/', '/dev/shm/', '/var/tmp/'))):
                 pid = exe.split('/')[2]
                 try:
                     import pwd
@@ -880,12 +980,81 @@ class Hunter(object):
                     cmd = open('/proc/%s/cmdline' % pid, 'rb').read().replace(b'\0', b' ').decode('utf-8', 'replace')
                 except (OSError, IOError):
                     cmd = ''
-                web = bool(WEB_USER_RE.match(owner))
+                web = bool(web_user_re.match(owner))
                 self.record('_system', 'DEEP_FILELESS_PROC', 'CRIT' if web else 'HIGH',
                             'Running process executed from memfd or a deleted temp file'
                             + (' (web user)' if web else ''),
                             False, time.time(), None, 'pid ' + pid,
                             'owner %s  %s  cmd: %s' % (owner, target, cmd[:200]))
+
+    def scan_proc_cmdline(self):
+        """Reverse shells and suspicious commands in running processes."""
+        for exe in glob.glob('/proc/[0-9]*/exe'):
+            pid = exe.split('/')[2]
+            try:
+                with open('/proc/%s/cmdline' % pid, 'rb') as fh:
+                    cmd = fh.read().replace(b'\0', b' ').decode('utf-8', 'replace').strip()
+            except (OSError, IOError):
+                continue
+            if not cmd:
+                continue
+            if REVSHELL_RE.search(cmd):
+                try:
+                    import pwd
+                    owner = pwd.getpwuid(os.stat('/proc/' + pid).st_uid).pw_name
+                except (OSError, KeyError):
+                    owner = '?'
+                self.record('_system', 'DEEP_REVSHELL_PROC', 'CRIT',
+                            'Running process with reverse shell pattern in cmdline',
+                            False, time.time(), None, 'pid ' + pid,
+                            'owner %s  cmd: %s' % (owner, cmd[:300]))
+
+    def scan_ld_preload(self):
+        """ld.so.preload hijacking."""
+        try:
+            with open('/etc/ld.so.preload', 'r') as fh:
+                content = fh.read().strip()
+            if content:
+                for line in content.splitlines():
+                    line = line.strip()
+                    if line and not line.startswith('#'):
+                        self.record('_system', 'DEEP_LD_PRELOAD', 'CRIT',
+                                    '/etc/ld.so.preload contains a library (rootkit indicator)',
+                                    False, os.path.getmtime('/etc/ld.so.preload'), None,
+                                    '/etc/ld.so.preload', line)
+        except (OSError, IOError):
+            pass
+
+    def scan_uid0(self):
+        """Extra UID 0 accounts."""
+        try:
+            import pwd
+            for entry in pwd.getpwall():
+                if entry.pw_uid == 0 and entry.pw_name != 'root':
+                    self.record('_system', 'DEEP_UID0_ACCOUNT', 'CRIT',
+                                'Non-root account with UID 0',
+                                False, None, None, '/etc/passwd',
+                                '%s uid=%d gid=%d home=%s shell=%s' % (
+                                    entry.pw_name, entry.pw_uid, entry.pw_gid,
+                                    entry.pw_dir, entry.pw_shell))
+        except Exception:
+            pass
+
+    def scan_shell_rc(self, web_user_re):
+        """Recently modified .bashrc/.profile/.bash_profile of web users."""
+        if not self.since:
+            return
+        import pwd
+        for entry in pwd.getpwall():
+            if not web_user_re.match(entry.pw_name):
+                continue
+            for rc in ('.bashrc', '.profile', '.bash_profile'):
+                path = os.path.join(entry.pw_dir, rc)
+                if os.path.isfile(path) and os.path.getmtime(path) >= self.since:
+                    self.record('_system', 'DEEP_WEB_RC_MODIFIED', 'MED',
+                                'Shell rc file of a web user modified inside the window',
+                                False, os.path.getmtime(path), None, path,
+                                'user %s, mtime %s' % (entry.pw_name, fmt_ts(os.path.getmtime(path))))
 
     def check_session(self, site, path):
         data = read_head(path, 1 << 20)
@@ -915,10 +1084,10 @@ class Hunter(object):
                         'Unusually large session file (>256 KB)',
                         False, mtime, None, path, 'mtime %s, %d bytes' % (fmt_ts(mtime), size))
 
-    def scan_crontabs(self):
+    def scan_crontabs(self, web_user_re):
         for f in glob.glob('/var/spool/cron/crontabs/*') + glob.glob('/var/spool/cron/*'):
             user = os.path.basename(f)
-            if not os.path.isfile(f) or not re.match(r'^(?:web\d+|www-data|apache|nginx|httpd)$', user):
+            if not os.path.isfile(f) or not web_user_re.match(user):
                 continue
             body = read_head(f, 65536).decode('utf-8', 'replace')
             jobs = [l for l in body.splitlines() if l.strip() and not l.lstrip().startswith('#')]
@@ -926,12 +1095,11 @@ class Hunter(object):
                 mtime = os.path.getmtime(f)
                 for j in jobs:
                     self.record('_system', 'DEEP_WEB_CRONTAB', 'MED',
-                                'Web user crontab (ISPConfig uses /etc/cron.d/ispc_*, so this is unusual)',
+                                'Web user crontab (%s, so this is unusual)' % self.profile['cron_note'],
                                 False, mtime, None, f, j)
 
     # -- wrap-up -----------------------------------------------------------
     def finalize(self):
-        # POST bursts per IP (ASLR brute force: ~590 POSTs in ~15 min)
         for ip, tss in self.post_ts.items():
             if len(tss) < self.a.post_burst:
                 continue
@@ -942,23 +1110,20 @@ class Hunter(object):
                             'POST/PUT burst from a single IP', False, tss[0], ip, 'access logs',
                             '%s: %d POSTs in %d s (sites: %s)' % (
                                 ip, n, self.a.post_window, ', '.join(sorted(self.post_sites[ip]))))
-        # startup sequence from the same client within --corr-window seconds: an anchor
-        # (max_input_vars warning or startup OOM) next to another startup signal
+
         win = self.a.corr_window
         for ip, evs in self.corr.items():
             evs.sort()
             for i, (ts, rid, site, where, text) in enumerate(evs):
                 if rid not in CORR_ANCHORS:
                     continue
-                # other startup signals from the same client, before or after the anchor
                 near = {e[1] for e in evs if abs(e[0] - ts) <= win} - {rid}
                 if near:
                     self.record(site, 'CHAIN_STARTUP', 'CRIT',
                                 'Same client: %s together with %s within %ds (PHP2Shell startup sequence)'
                                 % (rid, '/'.join(sorted(near)), win), True, ts, ip, where, text)
-                    break   # one chain per IP is enough to flag it
-        # arm -> fire: POST answered 500 (OOM) and later a POST answered 502/503
-        # (worker crashed) from the same IP within --post-window
+                    break
+
         for ip, evs in self.post_5xx.items():
             evs.sort()
             arms = [e for e in evs if e[1] == 500]
@@ -970,14 +1135,14 @@ class Hunter(object):
                                 'Same IP: POST answered 500 then POST answered %d (arm/fire pattern)' % f[1],
                                 False, a[0], ip, f[3], f[4])
                     break
-        # bursts per rule and site
+
         for agg in self.aggs.values():
             if agg.ts:
                 agg.ts.sort()
                 agg.maxw = max_window(agg.ts, self.a.window)
-                if agg.burst and agg.maxw >= self.a.burst:
-                    agg.sev = bump(agg.sev)
-                    agg.bursted = True
+            if agg.burst and agg.maxw >= self.a.burst:
+                agg.sev = bump(agg.sev)
+                agg.bursted = True
 
     def ip_ranking(self):
         score, detail = Counter(), defaultdict(Counter)
@@ -985,11 +1150,10 @@ class Hunter(object):
         for (site, rid), agg in self.aggs.items():
             w = SEV_WEIGHT[agg.sev]
             for ip, n in agg.ips.items():
-                score[ip] += w * min(n, 20)   # cap so noise does not drown out serious hits
+                score[ip] += w * min(n, 20)
                 detail[ip][rid] += n
-                sites[ip].add(site)
+            sites[ip].add(site)
         return [(ip, s, detail[ip], sites[ip]) for ip, s in score.most_common(self.a.top_ips) if s > 0]
-
 
 # ---------------------------------------------------------------------------
 # PHP versions
@@ -1012,7 +1176,6 @@ def pkg_version(path):
     except (OSError, subprocess.SubprocessError):
         pass
     return ''
-
 
 def php_versions():
     out, seen = [], set()
@@ -1046,7 +1209,6 @@ def php_versions():
                         'package': pkg_version(rp), 'vulnerable': vuln, 'status': status})
     return out
 
-
 def apache_php_modules():
     for cmd in (['apache2ctl', '-M'], ['apachectl', '-M'], ['httpd', '-M']):
         if shutil.which(cmd[0]):
@@ -1058,7 +1220,6 @@ def apache_php_modules():
             return [l.strip() for l in r.stdout.splitlines() if 'php' in l.lower()]
     return []
 
-
 # ---------------------------------------------------------------------------
 # Report
 # ---------------------------------------------------------------------------
@@ -1066,7 +1227,8 @@ def print_report(h, versions, modphp, nsites, c):
     a = h.a
     min_rank = SEV_RANK[a.min_sev]
     print(c('B', '== PHP2Shell hunt: %s, %s ==' % (socket.gethostname(), fmt_ts(time.time()))))
-    print('Window: %s | files: %d | lines: %d | sites: %d' % (
+    print('Env: %s | Window: %s | files: %d | lines: %d | sites: %d' % (
+        h.a.env,
         'since ' + fmt_ts(h.since) if h.since else 'all available',
         h.files_scanned, h.lines_scanned, nsites))
 
@@ -1076,6 +1238,7 @@ def print_report(h, versions, modphp, nsites, c):
             tag = {True: c('HIGH', '[VULN]'), False: c('LOW', '[ OK ]'), None: '[ ?? ]'}[v['vulnerable']]
             pkg = ' (%s)' % v['package'] if v['package'] else ''
             print('%s %-28s %-12s %s%s' % (tag, v['binary'], v['version'], v['status'], pkg))
+
     if modphp:
         print(c('HIGH', 'mod_php loaded in Apache (%s): this is the SAPI with demonstrated exploitation.'
                 % ', '.join(modphp)))
@@ -1083,10 +1246,10 @@ def print_report(h, versions, modphp, nsites, c):
     findings = sorted(((site, rid, agg) for (site, rid), agg in h.aggs.items()),
                       key=lambda x: (-SEV_RANK[x[2].sev], -x[2].count, x[0]))
 
-    # per-site summary
     per_site = defaultdict(Counter)
     for site, rid, agg in findings:
         per_site[site][agg.sev] += agg.count
+
     if per_site:
         print(c('B', '\n-- Per-site summary (events) --'))
         print('%-40s %6s %6s %6s %6s' % ('site', 'CRIT', 'HIGH', 'MED', 'LOW'))
@@ -1111,6 +1274,7 @@ def print_report(h, versions, modphp, nsites, c):
             print('       IPs: %s' % ', '.join('%s(%d)' % x for x in agg.ips.most_common(5)))
         for s in agg.samples:
             print(c('D', '       > %s' % s))
+
     if not shown:
         print('Nothing above the threshold.')
 
@@ -1136,13 +1300,14 @@ def print_report(h, versions, modphp, nsites, c):
                  'are only visible with ModSecurity (SecAuditLog) or an IDS.')
     if h.warnings:
         notes.append('%d read warnings (use -v to see them).' % len(h.warnings))
+
     print(c('B', '\n-- Notes --'))
     for n in notes:
         print('- ' + n)
 
-
 def to_json(h, versions, modphp):
     out = {'host': socket.gethostname(), 'generated': fmt_ts(time.time()),
+           'environment': h.a.env,
            'since': fmt_ts(h.since) if h.since else None,
            'files_scanned': h.files_scanned, 'lines_scanned': h.lines_scanned,
            'php_binaries': versions, 'mod_php': modphp, 'findings': [], 'ips': [],
@@ -1157,6 +1322,85 @@ def to_json(h, versions, modphp):
         out['ips'].append({'ip': ip, 'score': score, 'rules': dict(det), 'sites': sorted(sites)})
     return out
 
+def to_markdown(h, versions, modphp):
+    lines = []
+    lines.append('# PHP2Shell Hunt Report')
+    lines.append('')
+    lines.append('Host: %s' % socket.gethostname())
+    lines.append('Generated: %s' % fmt_ts(time.time()))
+    lines.append('Environment: %s' % h.a.env)
+    lines.append('Window: %s' % ('since ' + fmt_ts(h.since) if h.since else 'all available'))
+    lines.append('Files scanned: %d | Lines scanned: %d' % (h.files_scanned, h.lines_scanned))
+    lines.append('')
+
+    if versions:
+        lines.append('## PHP Binaries')
+        lines.append('')
+        lines.append('| Binary | Version | Status | Package |')
+        lines.append('|--------|---------|--------|---------|')
+        for v in versions:
+            tag = {True: 'VULNERABLE', False: 'patched', None: 'unknown'}[v['vulnerable']]
+            lines.append('| `%s` | %s | %s | %s |' % (v['binary'], v['version'], tag, v['package'] or '-'))
+        lines.append('')
+
+    if modphp:
+        lines.append('**mod_php loaded in Apache (%s): this is the SAPI with demonstrated exploitation.**'
+                     % ', '.join(modphp))
+        lines.append('')
+
+    findings = sorted(((site, rid, agg) for (site, rid), agg in h.aggs.items()),
+                      key=lambda x: (-SEV_RANK[x[2].sev], -x[2].count, x[0]))
+
+    if findings:
+        lines.append('## Findings')
+        lines.append('')
+        for site, rid, agg in findings:
+            if agg.sev == 'INFO':
+                continue
+            lines.append('### [%s] %s / %s (x%d)' % (agg.sev, site, rid, agg.count))
+            lines.append('')
+            lines.append('%s' % agg.desc)
+            if agg.ts:
+                lines.append('')
+                lines.append('First: %s | Last: %s | Peak: %d in %ds' % (
+                    fmt_ts(agg.ts[0]), fmt_ts(agg.ts[-1]), agg.maxw, h.a.window))
+            if agg.ips:
+                lines.append('')
+                lines.append('Top IPs: %s' % ', '.join('%s (%d)' % x for x in agg.ips.most_common(5)))
+            if agg.samples:
+                lines.append('')
+                lines.append('```')
+                for s in agg.samples:
+                    lines.append(s)
+                lines.append('```')
+            lines.append('')
+    else:
+        lines.append('## Findings')
+        lines.append('')
+        lines.append('No findings above the threshold.')
+        lines.append('')
+
+    ranking = h.ip_ranking()
+    if ranking:
+        lines.append('## IP Ranking')
+        lines.append('')
+        lines.append('| IP | Score | Rules | Sites |')
+        lines.append('|----|-------|-------|-------|')
+        for ip, score, det, sites in ranking:
+            lines.append('| %s | %d | %s | %s |' % (
+                ip, score,
+                ', '.join('%s:%d' % x for x in det.most_common(4)),
+                ', '.join(sorted(sites))[:80]))
+        lines.append('')
+
+    if h.warnings:
+        lines.append('## Warnings')
+        lines.append('')
+        for w in h.warnings:
+            lines.append('- %s' % w)
+        lines.append('')
+
+    return '\n'.join(lines)
 
 # ---------------------------------------------------------------------------
 # main
@@ -1172,11 +1416,13 @@ def parse_since(s):
             pass
     raise argparse.ArgumentTypeError('invalid date: %s (YYYY-MM-DD[ HH:MM] or Nd)' % s)
 
-
 def main():
     ap = argparse.ArgumentParser(
-        description='Hunt for PHP2Shell (CVE-2026-109618/109619) traces on an ISPConfig server.')
-    ap.add_argument('--www', default='/var/www', help='sites root (default /var/www)')
+        description='Hunt for PHP2Shell (CVE-2026-109618/109619) traces on hosting servers.')
+    ap.add_argument('--env', choices=sorted(ENV_PROFILES), default='ispconfig',
+                    help='server environment (default: ispconfig)')
+    ap.add_argument('--www', default=None, help='sites root (default depends on --env)')
+    ap.add_argument('--logs', nargs='+', help='log directories to scan (overrides auto-discovery)')
     ap.add_argument('--sites', nargs='+', help='only these sites (domain or webN)')
     ap.add_argument('--since', type=parse_since,
                     help='only events since this date: YYYY-MM-DD[ HH:MM] or 30d')
@@ -1198,9 +1444,14 @@ def main():
     ap.add_argument('--top-ips', type=int, default=15, help='how many IPs to list in the ranking (15)')
     ap.add_argument('--min-sev', default='LOW', choices=SEVERITIES[1:], help='minimum severity to print')
     ap.add_argument('--json', help='also write the report as JSON')
+    ap.add_argument('--md', help='also write the report as Markdown')
     ap.add_argument('--no-color', action='store_true', help='plain output, no ANSI colors')
     ap.add_argument('-v', '--verbose', action='store_true', help='print each file as it is read, plus read warnings')
     args = ap.parse_args()
+
+    profile = ENV_PROFILES[args.env]
+    if args.www is None:
+        args.www = profile['www_default']
 
     args.since_dt = args.since
     args.since_epoch = time.mktime(args.since.timetuple()) if args.since else None
@@ -1208,22 +1459,28 @@ def main():
     if os.geteuid() != 0:
         print('Warning: without root not every log will be readable.', file=sys.stderr)
 
-    h = Hunter(args)
+    h = Hunter(args, profile)
     sites = h.discover_sites()
-    if not sites:
-        print('No sites with a log/ dir found under %s' % args.www, file=sys.stderr)
 
-    h.scan_sites(sites)
+    if not sites and not args.logs:
+        print('No sites found under %s for env=%s, falling back to recursive search.'
+              % (args.www, args.env), file=sys.stderr)
+        h.scan_fallback()
+    else:
+        h.scan_sites(sites)
+
     if not args.no_global:
         h.scan_global()
-        if not args.no_journal:
-            h.scan_journal()
+    if not args.no_journal:
+        h.scan_journal()
     if args.deep:
         h.deep_scan(sites)
+
     h.finalize()
 
     versions = php_versions()
     modphp = apache_php_modules()
+
     print_report(h, versions, modphp, len(sites), Colors(sys.stdout.isatty() and not args.no_color))
 
     if args.json:
@@ -1231,14 +1488,18 @@ def main():
             json.dump(to_json(h, versions, modphp), fh, indent=2, ensure_ascii=False)
         print('\nJSON: %s' % args.json)
 
+    if args.md:
+        with open(args.md, 'w', encoding='utf-8') as fh:
+            fh.write(to_markdown(h, versions, modphp))
+        print('Markdown: %s' % args.md)
+
     top = max([SEV_RANK[agg.sev] for agg in h.aggs.values()] or [0])
     sys.exit(2 if top >= SEV_RANK['HIGH'] else 1 if top == SEV_RANK['MED'] else 0)
-
 
 if __name__ == '__main__':
     try:
         main()
-    except BrokenPipeError:      # output cut by | head, | less...
+    except BrokenPipeError:
         sys.stderr.close()
         sys.exit(0)
     except KeyboardInterrupt:
