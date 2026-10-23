@@ -16,10 +16,10 @@ PHP2Shell covers two PHP engine bugs fixed on 2026-10-21
                                <?php or serialized-object syntax.
 
 Access logs don't store request bodies, so most of the detection is indirect:
-User-Agent, status codes, POST bursts, PHP errors during request startup,
-worker crashes, OOM killer and restarts. With --deep it also checks session
-files, .php files in upload dirs, auto_prepend_file and crontabs of web users
-(post-exploitation artifacts).
+User-Agent, published source IPs, status codes, POST bursts, PHP errors during
+request startup, worker crashes, OOM killer and restarts. With --deep it also
+checks session files, webroots, temp dirs, published sample hashes, processes
+running from memfd and crontabs of web users (post-exploitation artifacts).
 
 Read-only. Run as root. Python 3.6+, standard library only.
 
@@ -35,6 +35,7 @@ import argparse
 import bz2
 import glob
 import gzip
+import hashlib
 import json
 import lzma
 import os
@@ -81,16 +82,32 @@ COMMON_RULES = [
     Rule('WAF_PHP2SHELL', 'HIGH',
          r'ModSecurity.*(?:php2shell|rawkey|php-gh11189)|id "3[12]0100\d"',
          'WAF rule for PHP2Shell/rawkey fired'),
-    Rule('IOC_RAWKEY', 'CRIT',
-         r'rawkey|coalition-scanner|php2shell',
-         'Exploit/scanner string (rawkey-rce, coalition-scanner-rawkey, php2shell)'),
+    # C2/staging hosts and domains from the Ellio honeypot report (Mirai loader, booter)
+    Rule('IOC_C2', 'CRIT',
+         r'(?<![\d.])(?:15\.235\.206\.16|92\.118\.112\.100|134\.199\.154\.64|117\.55\.202\.115|'
+         r'150\.251\.112\.208)(?![\d.])|godofthunder\.st|botlesscucks\.st|gettingheadfromduckysmom\.st|'
+         r'jackalsyn\.com',
+         'PHP2Shell C2/staging host or domain (Ellio, phpup-2026)'),
+    # UAs and markers seen in the wild: php2shell-scan/109618, php2shell-verify/1.0,
+    # php-session-startup-rce-poc, B8RAT/1.0 (OffSeq, Ellio); rawkey-rce and
+    # coalition-scanner-rawkey are not in any public report yet
+    Rule('IOC_STRING', 'CRIT',
+         r'rawkey|coalition-scanner|php2shell|php-session-startup-rce-poc|B8RAT/|'
+         r'PHP2SHELL_OK|JACKALPOC|P2SMA?R?K',
+         'Exploit/scanner string (UA, boundary or marker used by PHP2Shell tooling)'),
+    # multipart boundaries of public tooling; only visible in ModSecurity audit logs
+    Rule('IOC_BOUNDARY', 'HIGH',
+         r'boundary=-{2,8}p2s|-{4,8}p2s(?:hell)?[0-9a-f]{6,}|--nucleiBoundary|boundary=-{4,8}atk\b',
+         'Multipart boundary used by PHP2Shell tooling (needs a body-logging WAF)'),
 ]
 
 # Apache/nginx error logs, PHP/PHP-FPM logs and system logs.
 LOG_RULES = COMMON_RULES + [
     # CVE-2026-109618: the OOM happens before any script runs
     Rule('OOM_UNKNOWN', 'CRIT',
-         r'(?:Allowed memory size of \d+ bytes exhausted|Out of memory).{0,300}in Unknown on line 0',
+         r'(?:Allowed memory size of \d+ bytes exhausted|Out of memory).{0,300}in Unknown on line 0|'
+         r'PHP Request Startup:.{0,40}(?:Allowed memory size of \d+ bytes exhausted|Out of memory)|'
+         r'Allowed memory size of \d+ bytes exhausted.{0,300}rfc1867\.c',
          'OOM during request startup ("in Unknown on line 0"), CVE-2026-109618 signature', True),
     Rule('TIMEOUT_UNKNOWN', 'HIGH',
          r'Maximum execution time of \d+ seconds? exceeded.{0,200}in Unknown on line',
@@ -105,7 +122,7 @@ LOG_RULES = COMMON_RULES + [
     Rule('APACHE_PARENT_SEGV', 'CRIT', r'AH00060',
          'Segfault in the Apache parent process'),
     Rule('APACHE_CHILD_CRASH', 'HIGH',
-         r'AH0005[12]:.*exit signal (?:Segmentation fault|Aborted|Bus error|Illegal instruction|Floating point)',
+         r'AH0005[12]:.*exit signal (?:Segmentation fault|Abort(?:ed)?|Bus error|Illegal instruction|Floating point)',
          'Apache child killed by a signal (crash)', True),
     Rule('FPM_CHILD_CRASH', 'HIGH',
          r'child \d+ exited on signal (?:4|6|7|8|11)\b',
@@ -135,6 +152,25 @@ LOG_RULES = COMMON_RULES + [
          'OOM killer (other process)', True),
 
     # anomalous requests seen by PHP or the web server
+    # A session can only start before any script runs through the upload_progress
+    # callback. "cannot be sent" means output (usually a displayed startup warning)
+    # went out first. Seen in the hackplayers.com writeup of the CVE-2026-109619 chain.
+    Rule('STARTUP_SESSION', 'HIGH',
+         r'(?:PHP Request Startup|Unknown): Session (?:cookie|cache limiter) cannot be sent|'
+         r'Session (?:cookie|cache limiter) cannot be sent.{0,300}in Unknown on line 0',
+         'Session started during request startup (upload_progress path, CVE-2026-109619)', True),
+    # session file named after multipart boundary junk: the PHPSESSID came from the body
+    # (SigmaHQ php2shell rule, "sess_" + "/ndary=")
+    Rule('SESS_ID_BOUNDARY', 'CRIT', r'sess_\S{0,200}ndary=',
+         'Session file name holds multipart boundary text (session ID taken from the body)'),
+    Rule('SESSION_DECODE_STARTUP', 'HIGH',
+         r'(?:PHP Request Startup|Unknown): Failed to decode session object',
+         'Session decode failure during request startup (poisoned session, CVE-2026-109619)', True),
+    Rule('SESS_ID_ILLEGAL_STARTUP', 'HIGH',
+         r'(?:PHP Request Startup|Unknown): .{0,40}session id is too long or contains illegal characters',
+         'Illegal session ID during request startup (PHPSESSID injected via multipart)', True),
+    Rule('FCGI_BAD_RECORD', 'HIGH', r'upstream sent unexpected FastCGI record',
+         'nginx got a corrupt FastCGI record from PHP-FPM (lab-observed during exploitation)', True),
     Rule('NESTING_LEVEL', 'HIGH', r'Input variable nesting level exceeded',
          'Field names with excessive nesting (a[][][]...)', True),
     Rule('MULTIPART_MALFORMED', 'MED',
@@ -149,6 +185,14 @@ LOG_RULES = COMMON_RULES + [
          'Request body rejected for size or unparseable', True),
     Rule('INPUT_VARS', 'MED', r'Input variables exceeded',
          'Too many fields in the request (max_input_vars)', True),
+    Rule('SESSION_DECODE', 'MED', r'Failed to decode session object',
+         'Session decode failure', True),
+    Rule('SESS_ID_ILLEGAL', 'LOW', r'session id is too long or contains illegal characters',
+         'Illegal session ID (bots do this too)', True),
+    Rule('FCGI_WORKER_GONE', 'LOW',
+         r'upstream prematurely closed connection while reading response header|'
+         r'AH01075: Error dispatching request|readv\(\) failed \(104: Connection reset by peer\) while reading upstream',
+         'PHP backend dropped the request (crashed worker, correlate with OOM/SIGSEGV)', True),
     Rule('OOM_SCRIPT', 'MED', r'Allowed memory size of \d+ bytes exhausted',
          'memory_limit exhausted inside a script', True),
     Rule('OOM_PHP', 'HIGH', r'\bOut of memory\b',
@@ -163,7 +207,7 @@ LOG_RULES = COMMON_RULES + [
     Rule('EVAL_CODE', 'MED', r"eval\(\)'d code",
          'Error inside eval() code (possible webshell)'),
     Rule('PHP_STARTUP_ERR', 'LOW',
-         r'PHP (?:Fatal error|Warning|Notice).{0,300}in Unknown on line 0',
+         r'PHP (?:Fatal error|Warning|Notice).{0,300}in Unknown on line 0|PHP Request Startup:',
          'PHP error during request startup (Unknown line 0)', True),
     Rule('PHP_FATAL', 'LOW', r'PHP Fatal error',
          'PHP Fatal error', True),
@@ -182,6 +226,29 @@ LOG_RULES = COMMON_RULES + [
          r'(?:Apache|PHP .{0,20}FastCGI|php[\w.\-]*-fpm|nginx)',
          'Web service start/stop (systemd)'),
 ]
+
+# ---------------------------------------------------------------------------
+# Rules correlated per client IP in Hunter.finalize()
+CORR_ANCHORS = {'INPUT_VARS', 'OOM_UNKNOWN'}
+CORR_RULES = CORR_ANCHORS | {'STARTUP_SESSION', 'SESSION_DECODE_STARTUP', 'SESS_ID_ILLEGAL_STARTUP',
+                             'SESS_ID_BOUNDARY'}
+
+# Source IPs published as PHP2Shell senders (AWS MadPot, OffSeq, Ellio, Oct 2026). Most are
+# VPS, cloud or anonymisation exits shared with other traffic: a hit means "look closer",
+# not "compromised".
+KNOWN_SOURCE_IPS = {
+    # AWS MadPot (103.216.220.92 was seen on 2026-10-17, before disclosure)
+    '103.216.220.92', '31.223.184.166', '37.19.200.5', '134.209.159.64', '103.114.163.188',
+    '95.217.98.37',
+    # OffSeq Mirage
+    '94.154.43.7', '38.180.45.91', '80.66.66.66', '217.60.242.76', '87.192.237.19',
+    '34.19.34.88', '34.76.232.95', '34.76.218.47', '194.42.196.44',
+    # Ellio
+    '45.198.224.169', '92.118.112.100', '152.233.51.47', '146.70.202.189', '185.5.70.233',
+    '176.65.132.128', '122.97.242.167', '192.140.154.1', '47.238.232.123', '31.182.51.55',
+    '98.80.11.91', '200.119.44.50', '45.136.71.89', '34.136.122.211', '77.237.246.73',
+    '146.70.184.216', '38.207.136.217',
+}
 
 # ---------------------------------------------------------------------------
 # Access logs (combined, with or without leading %v, optional trailing %I %O)
@@ -212,6 +279,26 @@ SUSP_CODE_RE = re.compile(
     rb'eval\s*\(|base64_decode\s*\(|gzinflate\s*\(|str_rot13\s*\(|assert\s*\(|'
     rb'shell_exec\s*\(|passthru\s*\(|\bsystem\s*\(|proc_open\s*\(|popen\s*\(', re.I)
 SESS_PHP_RE = re.compile(rb'<\?(?:php\b|=)', re.I)
+# progress values / markers left by public tooling inside session files
+SESS_MARKER_RE = re.compile(
+    rb'P2SMA?R?K|POC_[0-9a-f]{8}|nuclei-probe|JACKALPOC|PHP2SHELL_OK|\|x\|i:1;|'
+    rb'shell_upload|phtml_test|php5_test|dbl_test')
+# session IDs used by public PoCs
+SESS_NAME_RE = re.compile(r'^sess_(?:leaksessionid\d*|attacksessionid\d*|nuclei.*|.*ndary=.*)$', re.I)
+# webshell dropped in the wild (Ellio): "Code by Bin", rootkit.net.cn, z-cg.com
+KNOWN_WEBSHELL_RE = re.compile(rb'Code by Bin|rootkit\.net\.cn|z-cg\.com')
+# SHA-256 of published samples (Ellio, phpup-2026)
+KNOWN_SHA256 = {
+    '0c5486f06620e26e316f4b33f318b0d646d5e1133789331aa2fed012360d1486': 'Mirai-style loader (nfs)',
+    '7133612558a5d0f257ca6bdb4f765453af9465bc5298acdcf33b5761b8c59aac': 'booter',
+    '17758cf05e3376f8448dff926564e038b763b4a46668455e2ccb5ac0839e629c': 'PHP webshell (Code by Bin)',
+    'dd98bf48899aa385035352688357742c73ddc5e47ec4ecc7d7b74c53c2e3ca3d': 'Go agent',
+    '0c254d547cac650bfbcb2275e30c2083737520a51a0511646f1fbb7ed60a0d63': 'php-up-2026 PoC archive',
+}
+# paths written by the loader seen in the wild
+KNOWN_DROP_PATHS = ['/tmp/nfs', '/dev/shm/.cache.so', '/var/tmp/nfs']
+TMP_DIRS = ['/tmp', '/var/tmp', '/dev/shm']
+WEB_USER_RE = re.compile(r'^(?:web\d+|www-data|apache|nginx|httpd|wwwrun)$')
 AUTO_PREPEND_RE = re.compile(r'auto_(?:prepend|append)_file', re.I)
 
 SKIP_FILE_RE = re.compile(
@@ -399,6 +486,8 @@ class Hunter(object):
         self.lines_scanned = 0
         self.req_bytes_seen = False
         self.warnings = []
+        self.corr = defaultdict(list)       # ip -> [(ts, rule_id, site, where, text)] for CORR_RULES
+        self.post_5xx = defaultdict(list)   # ip -> [(ts, status, site, where, line)] POSTs answered 5xx
 
         extra = self._ioc_rules()
         self.access_rules = extra + COMMON_RULES
@@ -431,6 +520,8 @@ class Hunter(object):
 
     # -- recording ---------------------------------------------------------
     def record(self, site, rid, sev, desc, burst, ts, ip, where, text):
+        if rid in CORR_RULES and ip and ts is not None:
+            self.corr[ip].append((ts, rid, site, where, text))
         key = (site, rid)
         agg = self.aggs.get(key)
         if agg is None:
@@ -494,6 +585,10 @@ class Hunter(object):
                 where = '%s:%d' % (label, lineno)
                 if self.access_pre.search(line):
                     self.apply_rules(self.access_rules, site, where, line, ts, ip)
+                if ip in KNOWN_SOURCE_IPS:
+                    self.record(site, 'IOC_KNOWN_IP', 'MED',
+                                'Request from an IP published as a PHP2Shell sender (shared infra, verify)',
+                                False, ts, ip, where, line)
                 if m:
                     self.check_access(site, where, line, m, ts, ip)
         else:
@@ -504,8 +599,12 @@ class Hunter(object):
                 ts = parse_ts(line)
                 if since and ts is not None and ts < since:
                     continue
-                self.apply_rules(self.log_rules, site, '%s:%d' % (label, lineno),
-                                 line, ts, client_ip(line))
+                ip = client_ip(line)
+                self.apply_rules(self.log_rules, site, '%s:%d' % (label, lineno), line, ts, ip)
+                if ip in KNOWN_SOURCE_IPS:
+                    self.record(site, 'IOC_KNOWN_IP', 'MED',
+                                'Request from an IP published as a PHP2Shell sender (shared infra, verify)',
+                                False, ts, ip, '%s:%d' % (label, lineno), line)
 
     def check_access(self, site, where, line, m, ts, ip):
         """Structural heuristics on an already parsed access log line."""
@@ -524,6 +623,13 @@ class Hunter(object):
             if ip and ts is not None:
                 self.post_ts[ip].append(ts)
                 self.post_sites[ip].add(site)
+                if status >= 500:
+                    self.post_5xx[ip].append((ts, status, site, where, line))
+            ua = m.group('ua') or ''
+            if ua.startswith('fasthttp'):
+                self.record(site, 'ACC_FASTHTTP_POST', 'MED',
+                            'POST with the fasthttp UA (used by the 1 MB memory-pressure cluster, OffSeq)',
+                            True, ts, ip, where, line)
             if status in REJECT_STATUS:
                 self.record(site, 'ACC_POST_REJECTED', 'MED',
                             'POST/PUT rejected by the server (400/411/413/415/417/431)',
@@ -647,6 +753,8 @@ class Hunter(object):
             for f in glob.glob('/tmp/sess_*'):
                 self.check_session('_sessions', f)
             self.scan_crontabs()
+            self.scan_system_tmp()
+            self.scan_memfd()
 
     def walk_webroot(self, site, web):
         for dirpath, _dirs, files in os.walk(web):
@@ -661,11 +769,18 @@ class Hunter(object):
                 if not PHP_EXT_RE.search(low):
                     continue
                 try:
-                    mtime = os.lstat(full).st_mtime
+                    st = os.lstat(full)
                 except OSError:
                     continue
+                mtime = st.st_mtime
+                head = read_head(full)
+                if KNOWN_WEBSHELL_RE.search(head) or self.known_hash(full, st):
+                    self.record(site, 'DEEP_KNOWN_WEBSHELL', 'CRIT',
+                                'Webshell published as dropped through PHP2Shell (Ellio)',
+                                False, mtime, None, full, 'mtime ' + fmt_ts(mtime))
+                    continue
                 if in_upload:
-                    if SUSP_CODE_RE.search(read_head(full)):
+                    if SUSP_CODE_RE.search(head):
                         self.record(site, 'DEEP_WEBSHELL_UPLOADS', 'CRIT',
                                     'PHP with webshell functions in an upload directory',
                                     False, mtime, None, full, 'mtime ' + fmt_ts(mtime))
@@ -697,12 +812,96 @@ class Hunter(object):
                     self.record(site, 'DEEP_PHP_IN_TMP', 'HIGH', 'PHP file in the site tmp/session dir',
                                 False, mtime, None, full, 'mtime ' + fmt_ts(mtime))
 
+    def known_hash(self, path, st=None, limit=16 << 20):
+        """Name of the published sample if the file's SHA-256 matches, else None."""
+        try:
+            st = st or os.lstat(path)
+            if not os.path.isfile(path) or st.st_size > limit:
+                return None
+            h = hashlib.sha256()
+            with open(path, 'rb') as fh:
+                for chunk in iter(lambda: fh.read(1 << 20), b''):
+                    h.update(chunk)
+            return KNOWN_SHA256.get(h.hexdigest())
+        except (OSError, IOError):
+            return None
+
+    def scan_system_tmp(self):
+        """Known drop paths, ELF files owned by web users in /tmp-like dirs, hash matches."""
+        import pwd
+        for pth in KNOWN_DROP_PATHS:
+            if os.path.lexists(pth):
+                mt = os.lstat(pth).st_mtime
+                self.record('_system', 'DEEP_KNOWN_DROP', 'CRIT',
+                            'Path used by the loader seen in PHP2Shell attacks (Ellio)',
+                            False, mt, None, pth, 'mtime ' + fmt_ts(mt))
+        for d in TMP_DIRS:
+            for dirpath, dirs, files in os.walk(d):
+                if dirpath.count(os.sep) - d.count(os.sep) >= 3:
+                    dirs[:] = []
+                for fn in files:
+                    full = os.path.join(dirpath, fn)
+                    try:
+                        st = os.lstat(full)
+                        owner = pwd.getpwuid(st.st_uid).pw_name
+                    except (OSError, KeyError):
+                        continue
+                    if not os.path.isfile(full):
+                        continue
+                    name = self.known_hash(full, st)
+                    if name:
+                        self.record('_system', 'DEEP_KNOWN_HASH', 'CRIT',
+                                    'File matches a published PHP2Shell sample hash',
+                                    False, st.st_mtime, None, full, '%s, owner %s' % (name, owner))
+                    elif WEB_USER_RE.match(owner) and read_head(full, 4) == b'\x7fELF':
+                        self.record('_system', 'DEEP_WEB_ELF_TMP', 'HIGH',
+                                    'ELF binary owned by a web user in a temp dir',
+                                    False, st.st_mtime, None, full,
+                                    'owner %s, %d bytes, mtime %s' % (owner, st.st_size, fmt_ts(st.st_mtime)))
+
+    def scan_memfd(self):
+        """Running processes executed from memfd (fileless), typical after RCE."""
+        for exe in glob.glob('/proc/[0-9]*/exe'):
+            try:
+                target = os.readlink(exe)
+            except OSError:
+                continue
+            if target.startswith('/memfd:runc'):
+                continue    # runc re-execs itself from memfd on container hosts
+            if target.startswith('/memfd:') or ('(deleted)' in target and
+                                                 target.startswith(('/tmp/', '/dev/shm/', '/var/tmp/'))):
+                pid = exe.split('/')[2]
+                try:
+                    import pwd
+                    owner = pwd.getpwuid(os.stat('/proc/' + pid).st_uid).pw_name
+                except (OSError, KeyError):
+                    owner = '?'
+                try:
+                    cmd = open('/proc/%s/cmdline' % pid, 'rb').read().replace(b'\0', b' ').decode('utf-8', 'replace')
+                except (OSError, IOError):
+                    cmd = ''
+                web = bool(WEB_USER_RE.match(owner))
+                self.record('_system', 'DEEP_FILELESS_PROC', 'CRIT' if web else 'HIGH',
+                            'Running process executed from memfd or a deleted temp file'
+                            + (' (web user)' if web else ''),
+                            False, time.time(), None, 'pid ' + pid,
+                            'owner %s  %s  cmd: %s' % (owner, target, cmd[:200]))
+
     def check_session(self, site, path):
         data = read_head(path, 1 << 20)
         try:
             mtime = os.path.getmtime(path)
+            size = os.path.getsize(path)
         except OSError:
             return
+        if SESS_NAME_RE.match(os.path.basename(path)):
+            self.record(site, 'DEEP_SESSION_POC_ID', 'HIGH',
+                        'Session ID used by public PHP2Shell PoCs, or holding boundary text',
+                        False, mtime, None, path, 'mtime %s, %d bytes' % (fmt_ts(mtime), size))
+        if SESS_MARKER_RE.search(data):
+            self.record(site, 'DEEP_SESSION_MARKER', 'HIGH',
+                        'Session holds a marker used by PHP2Shell tooling (P2SMARK, POC_, nuclei-probe...)',
+                        False, mtime, None, path, 'mtime %s, %d bytes' % (fmt_ts(mtime), size))
         if SESS_PHP_RE.search(data):
             self.record(site, 'DEEP_SESSION_PHP', 'CRIT',
                         'Session file containing a PHP tag (LFI chain payload, CVE-2026-109619)',
@@ -711,6 +910,10 @@ class Hunter(object):
             self.record(site, 'DEEP_SESSION_UPLOAD', 'MED',
                         'Session with leftover upload_progress data (should not persist with cleanup=On)',
                         False, mtime, None, path, 'mtime %s, %d bytes' % (fmt_ts(mtime), len(data)))
+        elif size > 256 * 1024:
+            self.record(site, 'DEEP_SESSION_BIG', 'LOW',
+                        'Unusually large session file (>256 KB)',
+                        False, mtime, None, path, 'mtime %s, %d bytes' % (fmt_ts(mtime), size))
 
     def scan_crontabs(self):
         for f in glob.glob('/var/spool/cron/crontabs/*') + glob.glob('/var/spool/cron/*'):
@@ -739,6 +942,34 @@ class Hunter(object):
                             'POST/PUT burst from a single IP', False, tss[0], ip, 'access logs',
                             '%s: %d POSTs in %d s (sites: %s)' % (
                                 ip, n, self.a.post_window, ', '.join(sorted(self.post_sites[ip]))))
+        # startup sequence from the same client within --corr-window seconds: an anchor
+        # (max_input_vars warning or startup OOM) next to another startup signal
+        win = self.a.corr_window
+        for ip, evs in self.corr.items():
+            evs.sort()
+            for i, (ts, rid, site, where, text) in enumerate(evs):
+                if rid not in CORR_ANCHORS:
+                    continue
+                # other startup signals from the same client, before or after the anchor
+                near = {e[1] for e in evs if abs(e[0] - ts) <= win} - {rid}
+                if near:
+                    self.record(site, 'CHAIN_STARTUP', 'CRIT',
+                                'Same client: %s together with %s within %ds (PHP2Shell startup sequence)'
+                                % (rid, '/'.join(sorted(near)), win), True, ts, ip, where, text)
+                    break   # one chain per IP is enough to flag it
+        # arm -> fire: POST answered 500 (OOM) and later a POST answered 502/503
+        # (worker crashed) from the same IP within --post-window
+        for ip, evs in self.post_5xx.items():
+            evs.sort()
+            arms = [e for e in evs if e[1] == 500]
+            fires = [e for e in evs if e[1] in (502, 503)]
+            for a in arms:
+                f = next((f for f in fires if 0 < f[0] - a[0] <= self.a.post_window), None)
+                if f:
+                    self.record(f[2], 'ACC_ARM_FIRE', 'HIGH',
+                                'Same IP: POST answered 500 then POST answered %d (arm/fire pattern)' % f[1],
+                                False, a[0], ip, f[3], f[4])
+                    break
         # bursts per rule and site
         for agg in self.aggs.values():
             if agg.ts:
@@ -950,14 +1181,17 @@ def main():
     ap.add_argument('--since', type=parse_since,
                     help='only events since this date: YYYY-MM-DD[ HH:MM] or 30d')
     ap.add_argument('--deep', action='store_true',
-                    help='also check sessions, .php in upload dirs, auto_prepend and crontabs')
+                    help='also check sessions, webroots, temp dirs, known hashes, memfd processes, crontabs')
     ap.add_argument('--no-global', action='store_true', help='skip global and system logs')
     ap.add_argument('--no-journal', action='store_true', help='skip journalctl')
     ap.add_argument('--ioc', action='append', help='extra string or IP to look for (repeatable)')
     ap.add_argument('--ioc-file', help='file with one IOC per line')
     ap.add_argument('--window', type=int, default=600, help='burst window in seconds (600)')
     ap.add_argument('--burst', type=int, default=5, help='events in the window to count as a burst (5)')
-    ap.add_argument('--post-window', type=int, default=900, help='window for POST bursts (900)')
+    ap.add_argument('--post-window', type=int, default=900,
+                    help='window for POST bursts and arm/fire pairs, seconds (900)')
+    ap.add_argument('--corr-window', type=int, default=60,
+                    help='window for the per-client startup sequence, seconds (60)')
     ap.add_argument('--post-burst', type=int, default=150, help='POSTs per IP in the window (150)')
     ap.add_argument('--big-post', type=int, default=1000000, help='large POST threshold in bytes (1000000)')
     ap.add_argument('--samples', type=int, default=3, help='sample lines per finding (3)')
